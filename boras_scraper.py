@@ -163,56 +163,65 @@ def build_filename(pdf_url: str, link_text: str, year: str) -> str:
 def get_meeting_links_by_year(session: requests.Session, index_url: str) -> dict[str, list[str]]:
     """
     Hämtar indexsidan och returnerar en dict {år: [absoluta mötessidans-URL, ...]}.
-    Strukturen på sidan: h3-rubriker med årtalen, följt av <ul> med möteslänkar.
+
+    Traverserar dokumentet i ordning istället för find_next_siblings() eftersom
+    h3-årsrubriker och ul-listor kan ligga i olika förälderelement i Sitevision.
     """
     print(f"\nHämtar indexsida: {index_url}")
     resp = safe_get(session, index_url)
     if resp is None:
         return {}
 
-    # Sätt Referer för efterföljande anrop
     session.headers["Referer"] = index_url
-
     soup = BeautifulSoup(resp.text, "html.parser")
+
+    # --- DEBUG: visa alla hittade rubriker ---
+    all_headings = soup.find_all(["h2", "h3", "h4"])
+    print(f"  [DEBUG] {len(all_headings)} rubriker hittade:")
+    for h in all_headings[:25]:
+        print(f"    <{h.name}> {repr(h.get_text(strip=True))}")
+
     year_meetings: dict[str, list[str]] = {}
+    current_year: str | None = None
+    seen_urls: set[str] = set()
 
-    # Identifiera alla h3-element med årtalen
-    for heading in soup.find_all(["h2", "h3", "h4"]):
-        heading_text = heading.get_text(strip=True)
+    # Traversera alla h2/h3/h4 och a-taggar i dokumentordning.
+    # Detta fungerar oavsett hur djupt nästlade de är.
+    for element in soup.find_all(["h2", "h3", "h4", "a"]):
+        tag = element.name
 
-        # Kontrollera om rubriken är ett av de önskade årtalen
-        if heading_text not in TARGET_YEARS:
-            continue
+        if tag in ("h2", "h3", "h4"):
+            text = element.get_text(strip=True)
+            if text in TARGET_YEARS:
+                current_year = text
+                if current_year not in year_meetings:
+                    year_meetings[current_year] = []
+            elif tag == "h2":
+                # En överordnad h2 bryter årkontexten
+                current_year = None
 
-        year = heading_text
-        meetings: list[str] = []
+        elif tag == "a" and current_year is not None:
+            href = element.get("href", "")
+            if not href:
+                continue
+            if ".pdf" in href.lower() or "/download/" in href.lower():
+                continue
+            if href.startswith("/"):
+                href = BASE_URL + href
+            if not href.startswith(BASE_URL):
+                continue
+            if href in seen_urls:
+                continue
+            seen_urls.add(href)
+            year_meetings[current_year].append(href)
 
-        # Iterera syskon-element EFTER rubriken tills nästa rubrik på samma nivå
-        for sibling in heading.find_next_siblings():
-            tag_name = sibling.name
-            if tag_name in ("h2", "h3", "h4"):
-                break  # Nästa årsrubrik – sluta
-
-            # Plocka ut alla <a>-taggar som pekar på mötessidor (inte PDF)
-            for a_tag in sibling.find_all("a", href=True):
-                href = a_tag["href"]
-                if ".pdf" in href.lower() or "/download/" in href.lower():
-                    continue  # Direkt PDF-länk – hanteras separat
-                if href.startswith("/"):
-                    href = BASE_URL + href
-                if href.startswith(BASE_URL):
-                    meetings.append(href)
-
-        if meetings:
-            # Avduplicera men behåll ordning
-            seen: set[str] = set()
-            unique_meetings = []
-            for m in meetings:
-                if m not in seen:
-                    seen.add(m)
-                    unique_meetings.append(m)
-            year_meetings[year] = unique_meetings
-            print(f"  År {year}: {len(unique_meetings)} möten hittade")
+    # Filtrera bort tomma år och rapportera
+    year_meetings = {y: m for y, m in year_meetings.items() if m}
+    if year_meetings:
+        for year in sorted(year_meetings.keys(), reverse=True):
+            print(f"  År {year}: {len(year_meetings[year])} möten hittade")
+    else:
+        print("  [VARNING] Inga möten hittades – kontrollera DEBUG-utskriften ovan")
 
     return year_meetings
 
