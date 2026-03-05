@@ -154,8 +154,11 @@ def build_filename(pdf_url: str, link_text: str) -> str:
 
 def get_pdf_links(session: requests.Session, index_url: str) -> list[tuple[str, str, str]]:
     """
-    Hämtar indexsidan och returnerar lista med (pdf_url, link_text, year)
-    för alla PDF-filer vars år finns i TARGET_YEARS.
+    Hämtar indexsidan och returnerar lista med (pdf_url, link_text, year).
+
+    Skövde använder Next.js – PDF-URL:er bäddas in i JSON i <script>-taggar,
+    inte som vanliga <a href>-taggar. Därför söker vi direkt i rå HTML-text
+    med regex efter /globalassets/...pdf-mönster.
     """
     print(f"\nHamtar indexsida: {index_url}")
     resp = safe_get(session, index_url)
@@ -163,27 +166,23 @@ def get_pdf_links(session: requests.Session, index_url: str) -> list[tuple[str, 
         return []
 
     session.headers["Referer"] = index_url
-    soup = BeautifulSoup(resp.text, "html.parser")
+    html = resp.text
+
+    # Hitta alla unika /globalassets/...pdf-sökvägar i rå HTML (inkl. JSON-data)
+    raw_paths = re.findall(
+        r'(/globalassets/[^"\'<>\s\\]+\.pdf)',
+        html,
+        re.IGNORECASE,
+    )
 
     results: list[tuple[str, str, str]] = []
     seen_urls: set[str] = set()
 
-    for a_tag in soup.find_all("a", href=True):
-        href: str = a_tag["href"]
-        text: str = a_tag.get_text(strip=True)
-
-        # Absolut URL
-        if href.startswith("/"):
-            href = BASE_URL + href
-        elif not href.startswith("http"):
-            href = urllib.parse.urljoin(index_url, href)
-
-        # Måste vara en PDF under /globalassets/
-        url_path = urllib.parse.urlparse(href).path
-        if not urllib.parse.unquote(url_path).lower().endswith(".pdf"):
-            continue
-        if "/globalassets/" not in href:
-            continue
+    for path in raw_paths:
+        # JSON-escaped snedstreck (\/) -> /
+        path = path.replace("\\/", "/")
+        path = urllib.parse.unquote(path)
+        href = BASE_URL + path
 
         if href in seen_urls:
             continue
@@ -193,7 +192,10 @@ def get_pdf_links(session: requests.Session, index_url: str) -> list[tuple[str, 
             continue
 
         seen_urls.add(href)
-        results.append((href, text, year))
+        # Länktext: bygg från filnamnet i URL:en (ingen riktig länktext tillgänglig)
+        filename_base = os.path.splitext(os.path.basename(path))[0]
+        link_text = filename_base.replace("-", " ").replace("_", " ")
+        results.append((href, link_text, year))
 
     # Statistik per år
     year_counts: dict[str, int] = {}
