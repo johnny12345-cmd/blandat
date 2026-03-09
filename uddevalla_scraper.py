@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-Uddevalla Kommun PDF Protocol Scraper
-======================================
-Laddar ner PDF-protokoll och handlingar från Uddevalla kommuns hemsida för:
-  - Kommunfullmäktige (kallelse och protokoll)
-  - Kommunstyrelsen (kallelse och protokoll)
+Uddevalla Kommun – Kommunfullmäktige PDF-skrapare (2024–2026)
+=============================================================
+Laddar ner kallelser och protokoll för Kommunfullmäktige från
+Uddevalla kommuns hemsida.
 
-Källa 1 – Indexsidor (SiteVision fillistor):
-  Uddevalla använder SiteVision. PDF-URL:er bäddas in i JSON via
-  AppRegistry.registerInitialState() i <script>-taggar.
-  OBS: Indexsidorna visar bara innevarande år (2026).
+Källa 1 – SiteVision-indexsida (visar bara innevarande år):
+  https://www.uddevalla.se/.../kommunfullmaktiges-kallelse-och-protokoll.html
+  PDF-URL:er bäddas in i JSON via AppRegistry.registerInitialState().
 
-Källa 2 – Nyhetsarkikel:
-  Äldre handlingar (fr.o.m. aug 2025) länkas från nyhetsartiklar under
-  /nyheter/nyhetsarkiv/. Skriptet hämtar nyhetslistningssidan, identifierar
-  relevanta artiklar och extraherar /download/-PDF-er därifrån.
-  Nyhetslistningen täcker ca 6 månader bakåt; handlingar äldre än så (2022–
-  tidig 2025) kan bara nås via kommunens LEX-system och ingår ej här.
+Källa 2 – Nyhetslistning (täcker ~6–12 månader bakåt):
+  Artiklar om kommunfullmäktige under /nyhetsarkiv/ länkas PDF-filer.
+  Skriptet paginerar genom alla tillgängliga nyhetssidor (?page=N)
+  tills inga nya relevanta artiklar hittas.
+
+BEGRÄNSNING:
+  Dokument äldre än det som nyhetslistningen täcker (typiskt jan–aug 2025
+  och hela 2024) publiceras inte öppet på webben. De finns i kommunens
+  LEX-system (kräver inloggning) och kan inte laddas ner med detta skript.
 """
 
 import os
@@ -33,37 +34,28 @@ import requests
 
 BASE_URL = "https://www.uddevalla.se"
 
-# Källa 1: SiteVision-fillistor (visar bara aktuellt år)
-INDEX_PAGES = {
-    "kommunfullmaktige": (
-        "https://www.uddevalla.se/kommun-och-politik/politik-och-demokrati/"
-        "moten-och-protokoll/kallelse-och-protokoll/"
-        "kommunfullmaktiges-kallelse-och-protokoll.html"
-    ),
-    "kommunstyrelsen": (
-        "https://www.uddevalla.se/kommun-och-politik/politik-och-demokrati/"
-        "moten-och-protokoll/kallelse-och-protokoll/"
-        "kommunstyrelsens-kallelse-och-protokoll.html"
-    ),
-}
+INDEX_URL = (
+    "https://www.uddevalla.se/kommun-och-politik/politik-och-demokrati/"
+    "moten-och-protokoll/kallelse-och-protokoll/"
+    "kommunfullmaktiges-kallelse-och-protokoll.html"
+)
 
-# Källa 2: Nyhetslistning med artiklar om möten (täcker ~6 mån bakåt)
-NEWS_LISTING_URL = (
+NEWS_LISTING_BASE = (
     "https://www.uddevalla.se/kommun-och-politik/nyheter/"
     "nyheter-kommun-och-politik.html"
 )
 
-# Nyckelord i nyhetsartikelns URL som avgör vilken sektion PDF:en tillhör
-NEWS_SECTION_KEYWORDS = {
-    "kommunfullmaktige": ["kommunfullmaktige"],
-    "kommunstyrelsen":   ["kommunstyrelsen"],
-}
+# Nyckelord som en nyhetsartikel-URL måste innehålla för att räknas
+NEWS_KEYWORDS = ["kommunfullmaktige"]
 
-TARGET_YEARS = {"2022", "2023", "2024", "2025", "2026"}
+TARGET_YEARS = {"2024", "2025", "2026"}
+
+# Antal nyhetssidor att söka igenom (sida 1 = ingen page-param, sedan ?page=2 …)
+MAX_NEWS_PAGES = 20
 
 DOWNLOAD_ROOT = Path(
     r"C:\Users\anan17\OneDrive - Sveriges Television\AI\Kommunprotokoll\Uddevalla"
-)
+) / "kommunfullmaktige"
 
 REQUEST_TIMEOUT = 30
 DELAY_BETWEEN_DOWNLOADS = 1
@@ -84,7 +76,6 @@ HEADERS = {
     "Upgrade-Insecure-Requests": "1",
     "DNT": "1",
 }
-
 
 # ---------------------------------------------------------------------------
 # Hjälpfunktioner
@@ -125,7 +116,7 @@ def sanitize_filename(name: str) -> str:
 
 
 def extract_year_from_text(text: str) -> str | None:
-    m = re.search(r'(202[2-9]|2030)', text)
+    m = re.search(r'(202[2-9])', text)
     return m.group(1) if m else None
 
 
@@ -156,30 +147,26 @@ def extract_pdf_links_from_html(
 
 
 # ---------------------------------------------------------------------------
-# Källa 1 – SiteVision-indexsidor
+# Källa 1 – SiteVision-indexsida
 # ---------------------------------------------------------------------------
 
 def get_pdf_links_from_index(
-    session: requests.Session, index_url: str
+    session: requests.Session,
+    seen_urls: set[str],
 ) -> list[tuple[str, str, str]]:
-    """
-    Hämtar indexsidan och returnerar lista med (pdf_url, filnamn, year).
-    Visar bara innevarande årets dokument (SiteVision-begränsning).
-    """
-    print(f"\nHamtar indexsida: {index_url}")
-    resp = safe_get(session, index_url)
+    """Hämtar indexsidan (visar bara innevarande år)."""
+    print(f"\nHamtar indexsida: {INDEX_URL}")
+    resp = safe_get(session, INDEX_URL)
     if resp is None:
         return []
 
-    session.headers["Referer"] = index_url
-    seen_urls: set[str] = set()
+    session.headers["Referer"] = INDEX_URL
     results = extract_pdf_links_from_html(resp.text, seen_urls)
 
-    year_counts: dict[str, int] = {}
-    for _, _, y in results:
-        year_counts[y] = year_counts.get(y, 0) + 1
-
     if results:
+        year_counts: dict[str, int] = {}
+        for _, _, y in results:
+            year_counts[y] = year_counts.get(y, 0) + 1
         for y in sorted(year_counts.keys(), reverse=True):
             print(f"  Ar {y}: {year_counts[y]} PDF(er) hittade (indexsida)")
     else:
@@ -189,94 +176,89 @@ def get_pdf_links_from_index(
 
 
 # ---------------------------------------------------------------------------
-# Källa 2 – Nyhetsarkikelter
+# Källa 2 – Nyhetslistning med paginering
 # ---------------------------------------------------------------------------
 
-def _section_from_filename(filename: str) -> str | None:
-    """Avgör sektion utifrån PDF-filnamnet."""
-    fl = filename.lower()
-    if "kommunfullm" in fl:
-        return "kommunfullmaktige"
-    if "kommunstyrel" in fl:
-        return "kommunstyrelsen"
-    return None
+def _collect_article_urls(session: requests.Session) -> list[str]:
+    """
+    Paginerar igenom nyhetslistningen och returnerar URL:er till alla
+    kommunfullmäktige-artiklar som hittas.
+    """
+    all_article_urls: list[str] = []
+    seen_article_urls: set[str] = set()
+
+    for page_num in range(1, MAX_NEWS_PAGES + 1):
+        if page_num == 1:
+            listing_url = NEWS_LISTING_BASE
+        else:
+            listing_url = f"{NEWS_LISTING_BASE}?page={page_num}"
+
+        print(f"  Nyhetslistning sida {page_num}: {listing_url}")
+        resp = safe_get(session, listing_url)
+        if resp is None:
+            print(f"  Kunde inte hamta sida {page_num}, avslutar paginering.")
+            break
+
+        html = resp.text
+        article_paths = re.findall(
+            r'(/[^"\'<>\s]*nyhetsarkiv/\d{4}-\d{2}-\d{2}-[^"\'<>\s]+\.html)',
+            html,
+            re.IGNORECASE,
+        )
+
+        new_found = 0
+        for path in article_paths:
+            full_url = BASE_URL + path
+            if full_url in seen_article_urls:
+                continue
+            path_lower = path.lower()
+            if any(kw in path_lower for kw in NEWS_KEYWORDS):
+                all_article_urls.append(full_url)
+                seen_article_urls.add(full_url)
+                new_found += 1
+
+        print(f"    Hittade {new_found} nya kommunfullmaktige-artiklar pa sida {page_num}")
+
+        # Stoppa om inga nya artiklar eller om sidan inte har nyhetsarkiv-lankar alls
+        if not article_paths:
+            print("  Inga fler artiklar pa denna sida, avslutar paginering.")
+            break
+
+        time.sleep(0.5)
+
+    return all_article_urls
 
 
 def get_pdf_links_from_news(
     session: requests.Session,
-) -> dict[str, list[tuple[str, str, str]]]:
+    seen_urls: set[str],
+) -> list[tuple[str, str, str]]:
     """
-    Hämtar nyhetslistningssidan, identifierar artiklar om kommunfullmäktige
-    och kommunstyrelsen, besöker varje artikel och extraherar PDF-länkar.
-
-    Returnerar dict {section: [(pdf_url, filnamn, year), ...]}.
+    Paginerar nyhetslistningen, besöker varje kommunfullmäktige-artikel
+    och extraherar PDF-er.
     """
-    print(f"\nHamtar nyhetslistning: {NEWS_LISTING_URL}")
-    resp = safe_get(session, NEWS_LISTING_URL)
-    if resp is None:
-        return {}
+    print(f"\nHamtar nyhetsartiklar (upp till {MAX_NEWS_PAGES} sidor) ...")
+    article_urls = _collect_article_urls(session)
+    print(f"\n  Totalt {len(article_urls)} kommunfullmaktige-artiklar hittade")
 
-    session.headers["Referer"] = NEWS_LISTING_URL
-    html = resp.text
+    results: list[tuple[str, str, str]] = []
 
-    # Hitta alla nyhetsartikel-URL:er under /nyhetsarkiv/
-    article_paths = re.findall(
-        r'(/[^"\'<>\s]*nyhetsarkiv/\d{4}-\d{2}-\d{2}-[^"\'<>\s]+\.html)',
-        html,
-        re.IGNORECASE,
-    )
-
-    # Bestäm vilka artiklar som är relevanta per sektion
-    section_article_urls: dict[str, list[str]] = {s: [] for s in NEWS_SECTION_KEYWORDS}
-    seen_article_urls: set[str] = set()
-    for path in article_paths:
-        full_url = BASE_URL + path
-        if full_url in seen_article_urls:
+    for article_url in article_urls:
+        time.sleep(0.5)
+        art_resp = safe_get(session, article_url)
+        if art_resp is None:
             continue
-        path_lower = path.lower()
-        for section, keywords in NEWS_SECTION_KEYWORDS.items():
-            if any(kw in path_lower for kw in keywords):
-                section_article_urls[section].append(full_url)
-                seen_article_urls.add(full_url)
-                break  # en artikel tillhör bara en sektion
+        session.headers["Referer"] = article_url
+        pdfs = extract_pdf_links_from_html(art_resp.text, seen_urls)
+        if pdfs:
+            print(f"  {article_url.split('/')[-1]}: {len(pdfs)} PDF(er)")
+        results.extend(pdfs)
 
-    total_articles = sum(len(v) for v in section_article_urls.values())
-    print(f"  Hittade {total_articles} relevanta nyhetsartiklar")
-    for section, urls in section_article_urls.items():
-        if urls:
-            print(f"    {section}: {len(urls)} artiklar")
-
-    # Besök varje artikel och extrahera PDF-er
-    results: dict[str, list[tuple[str, str, str]]] = {s: [] for s in NEWS_SECTION_KEYWORDS}
-    seen_pdf_urls: set[str] = set()
-
-    for section, article_urls in section_article_urls.items():
-        for article_url in article_urls:
-            time.sleep(0.5)
-            art_resp = safe_get(session, article_url)
-            if art_resp is None:
-                continue
-            session.headers["Referer"] = article_url
-            pdfs = extract_pdf_links_from_html(art_resp.text, seen_pdf_urls)
-
-            for pdf_url, filename, year in pdfs:
-                # Dubbel-kontroll: PDF:en bör tillhöra rätt sektion
-                detected_section = _section_from_filename(filename)
-                if detected_section and detected_section != section:
-                    # Lägg i rätt sektion istället
-                    results.setdefault(detected_section, []).append(
-                        (pdf_url, filename, year)
-                    )
-                else:
-                    results[section].append((pdf_url, filename, year))
-
-    for section, pdfs in results.items():
-        year_counts: dict[str, int] = {}
-        for _, _, y in pdfs:
-            year_counts[y] = year_counts.get(y, 0) + 1
-        if year_counts:
-            for y in sorted(year_counts.keys(), reverse=True):
-                print(f"  {section} Ar {y}: {year_counts[y]} PDF(er) hittade (nyheter)")
+    year_counts: dict[str, int] = {}
+    for _, _, y in results:
+        year_counts[y] = year_counts.get(y, 0) + 1
+    for y in sorted(year_counts.keys(), reverse=True):
+        print(f"  Ar {y}: {year_counts[y]} PDF(er) hittade (nyheter)")
 
     return results
 
@@ -324,25 +306,75 @@ def download_pdf(
     return False
 
 
-def download_pdf_list(
-    session: requests.Session,
-    pdf_links: list[tuple[str, str, str]],
-    output_dir: Path,
-    referer: str,
-    label: str,
-) -> tuple[int, int, int]:
-    """Laddar ner en lista PDF-er. Returnerar (nedladdade, hoppade, misslyckade)."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    total_downloaded = total_skipped = total_failed = 0
+# ---------------------------------------------------------------------------
+# Huvudflöde
+# ---------------------------------------------------------------------------
 
-    for pdf_url, filename, year in pdf_links:
+def main() -> None:
+    print("Uddevalla Kommunfullmaktige – Kallelser och Protokoll 2024–2026")
+    print("=" * 60)
+    print(f"Sparar filer till: {DOWNLOAD_ROOT}")
+    print(f"Filtrerade ar: {', '.join(sorted(TARGET_YEARS))}")
+    print(
+        "\nOBS: Indexsidan visar bara aktuellt ar (2026)."
+        "\n     2025 hamtas via nyhetsartiklar (tillbaka ~6-12 man)."
+        "\n     2024 ar sannolikt ej tillgangligt via oppet webb –"
+        "\n     dessa dokument kravs via kommunens LEX-system."
+    )
+
+    session = make_session()
+    print("\nInitierar session ...")
+    if safe_get(session, BASE_URL):
+        print("  OK")
+    else:
+        print("  [Varning] Kunde inte initiera session, fortsatter anda ...")
+    time.sleep(1)
+
+    seen_pdf_urls: set[str] = set()
+    all_pdfs: list[tuple[str, str, str]] = []
+
+    # Källa 1: indexsida (2026)
+    print(f"\n{'='*60}")
+    print("KALLA 1: INDEXSIDA (aktuellt ar)")
+    print(f"{'='*60}")
+    all_pdfs.extend(get_pdf_links_from_index(session, seen_pdf_urls))
+    time.sleep(1)
+
+    # Källa 2: nyhetsartiklar (2025 och eventuellt 2024)
+    print(f"\n{'='*60}")
+    print("KALLA 2: NYHETSARTIKLAR")
+    print(f"{'='*60}")
+    all_pdfs.extend(get_pdf_links_from_news(session, seen_pdf_urls))
+
+    # Sammanfattning av vad som hittades
+    print(f"\n{'='*60}")
+    print(f"TOTALT HITTADE: {len(all_pdfs)} PDF(er)")
+    year_summary: dict[str, int] = {}
+    for _, _, y in all_pdfs:
+        year_summary[y] = year_summary.get(y, 0) + 1
+    for y in sorted(year_summary.keys(), reverse=True):
+        print(f"  {y}: {year_summary[y]} fil(er)")
+    print(f"{'='*60}")
+
+    if not all_pdfs:
+        print("\nInga handlingar hittades. Avslutar.")
+        return
+
+    # Ladda ner
+    print(f"\n{'='*60}")
+    print("LADDAR NER")
+    print(f"{'='*60}")
+    DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+
+    total_downloaded = total_skipped = total_failed = 0
+    for pdf_url, filename, year in all_pdfs:
         dest_filename = sanitize_filename(filename)
         if not dest_filename.lower().endswith(".pdf"):
             dest_filename += ".pdf"
-        dest_path = output_dir / dest_filename
+        dest_path = DOWNLOAD_ROOT / dest_filename
 
         already_existed = dest_path.exists()
-        success = download_pdf(session, pdf_url, dest_path, referer=referer)
+        success = download_pdf(session, pdf_url, dest_path, referer=INDEX_URL)
 
         if success:
             if already_existed:
@@ -354,92 +386,12 @@ def download_pdf_list(
 
         time.sleep(DELAY_BETWEEN_DOWNLOADS)
 
-    return total_downloaded, total_skipped, total_failed
-
-
-# ---------------------------------------------------------------------------
-# Huvudflöde
-# ---------------------------------------------------------------------------
-
-def main() -> None:
-    print("Uddevalla Kommun PDF-skrapare")
-    print("=" * 60)
-    print(f"Sparar filer till: {DOWNLOAD_ROOT}")
-    print(f"Filtrerade ar: {', '.join(sorted(TARGET_YEARS))}")
-    print(
-        "\nOBS: Indexsidorna visar bara 2026. Aldre handlingar (aug 2025-)\n"
-        "     hamtas via nyhetsartiklar. Handlingar fore aug 2025 gar\n"
-        "     bara att na via kommunens LEX-system och laddas inte ner har."
-    )
-
-    session = make_session()
-    print("\nInitierar session mot Uddevalla kommuns hemsida ...")
-    if safe_get(session, BASE_URL):
-        print("  Session initierad OK")
-    else:
-        print("  [Varning] Kunde inte initiera session, fortsatter anda ...")
-    time.sleep(1)
-
-    # Samla ihop alla PDF-er per sektion (dedup via seen_pdf_urls)
-    all_pdfs: dict[str, list[tuple[str, str, str]]] = {
-        s: [] for s in INDEX_PAGES
-    }
-    seen_pdf_urls: set[str] = set()
-
-    # Källa 1: indexsidor
-    print(f"\n{'='*60}")
-    print("KALLA 1: INDEXSIDOR (aktuellt ar)")
-    print(f"{'='*60}")
-    for section_name, index_url in INDEX_PAGES.items():
-        links = get_pdf_links_from_index(session, index_url)
-        for item in links:
-            pdf_url, filename, year = item
-            if pdf_url not in seen_pdf_urls:
-                seen_pdf_urls.add(pdf_url)
-                all_pdfs[section_name].append(item)
-        time.sleep(1)
-
-    # Källa 2: nyhetsartiklar
-    print(f"\n{'='*60}")
-    print("KALLA 2: NYHETSARTIKLAR (aug 2025 och framat)")
-    print(f"{'='*60}")
-    news_pdfs = get_pdf_links_from_news(session)
-    for section_name, links in news_pdfs.items():
-        for item in links:
-            pdf_url, filename, year = item
-            if pdf_url not in seen_pdf_urls:
-                seen_pdf_urls.add(pdf_url)
-                all_pdfs.setdefault(section_name, []).append(item)
-
-    # Ladda ner
-    print(f"\n{'='*60}")
-    print("LADDAR NER")
-    print(f"{'='*60}")
-    grand_downloaded = grand_skipped = grand_failed = 0
-
-    for section_name, pdf_links in all_pdfs.items():
-        if not pdf_links:
-            print(f"\n[{section_name}] Inga handlingar hittades.")
-            continue
-
-        print(f"\n--- {section_name.upper()} ({len(pdf_links)} filer) ---")
-        output_dir = DOWNLOAD_ROOT / section_name
-        dl, sk, fa = download_pdf_list(
-            session, pdf_links, output_dir,
-            referer=INDEX_PAGES.get(section_name, BASE_URL),
-            label=section_name,
-        )
-        grand_downloaded += dl
-        grand_skipped += sk
-        grand_failed += fa
-        time.sleep(1)
-
     print(f"\n{'='*60}")
     print("TOTALT")
     print(f"{'='*60}")
-    print(f"  Nedladdade  : {grand_downloaded}")
-    print(f"  Hoppade over: {grand_skipped}")
-    print(f"  Misslyckade : {grand_failed}")
+    print(f"  Nedladdade  : {total_downloaded}")
+    print(f"  Hoppade over: {total_skipped}")
+    print(f"  Misslyckade : {total_failed}")
     print("\nKlart!")
 
 
