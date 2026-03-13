@@ -14,6 +14,8 @@ Kommittés-ID:
   Kommunfullmäktige = 887
 """
 
+import shutil
+import subprocess
 import time
 import re
 from pathlib import Path
@@ -39,7 +41,8 @@ DOWNLOAD_ROOT = Path(
     r"\Workshop val\Kommunprotokoll\Alingsas"
 )
 
-MAX_PDF_BYTES = 100 * 1024 * 1024   # 100 MB
+MAX_PDF_BYTES = 100 * 1024 * 1024    # 100 MB – maxgräns för sammanslagen fil
+COMPRESS_THRESHOLD = 150 * 1024 * 1024  # 150 MB – komprimera om filen är större
 
 REQUEST_TIMEOUT = 60
 DELAY_BETWEEN_DOWNLOADS = 1.0
@@ -272,6 +275,84 @@ def merge_with_size_limit(
 
 
 # ---------------------------------------------------------------------------
+# PDF-komprimering (för filer > COMPRESS_THRESHOLD)
+# ---------------------------------------------------------------------------
+
+def _ghostscript_executable() -> str | None:
+    """Returnerar sökväg till Ghostscript om det finns installerat, annars None."""
+    for name in ("gswin64c", "gswin32c", "gs"):
+        if shutil.which(name):
+            return name
+    return None
+
+
+def compress_pdf(path: Path, threshold_bytes: int = COMPRESS_THRESHOLD) -> None:
+    """
+    Komprimerar en PDF-fil på plats om den är större än threshold_bytes.
+    Försöker först med Ghostscript (bäst komprimering), sedan pypdf.
+    Skriver över originalfilen om komprimeringen lyckas och ger en mindre fil.
+    """
+    if not path.exists():
+        return
+    size = path.stat().st_size
+    if size <= threshold_bytes:
+        return
+
+    sz_mb = size / 1024 / 1024
+    print(f"  [Komprimerar] {path.name} ({sz_mb:.1f} MB > {threshold_bytes // 1024 // 1024} MB)")
+
+    # --- Försök 1: Ghostscript ---
+    gs = _ghostscript_executable()
+    if gs:
+        tmp = path.with_suffix(".tmp_compressed.pdf")
+        cmd = [
+            gs,
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            "-dPDFSETTINGS=/ebook",   # ~150 dpi bilder, god balans storlek/kvalitet
+            "-dNOPAUSE", "-dQUIET", "-dBATCH",
+            f"-sOutputFile={tmp}",
+            str(path),
+        ]
+        try:
+            subprocess.run(cmd, check=True, timeout=300)
+            new_size = tmp.stat().st_size
+            if new_size < size:
+                tmp.replace(path)
+                saved_mb = (size - new_size) / 1024 / 1024
+                print(f"    [Ghostscript OK] {new_size / 1024 / 1024:.1f} MB (sparade {saved_mb:.1f} MB)")
+            else:
+                tmp.unlink(missing_ok=True)
+                print(f"    [Ghostscript] Komprimeringen gav ingen vinst – behaller original")
+            return
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            tmp.unlink(missing_ok=True)
+            print(f"    [Ghostscript fel] {exc} – provar pypdf")
+
+    # --- Försök 2: pypdf compress_content_streams ---
+    tmp = path.with_suffix(".tmp_compressed.pdf")
+    try:
+        reader = PdfReader(str(path))
+        writer = PdfWriter()
+        for page in reader.pages:
+            page.compress_content_streams()
+            writer.add_page(page)
+        with open(tmp, "wb") as f:
+            writer.write(f)
+        new_size = tmp.stat().st_size
+        if new_size < size:
+            tmp.replace(path)
+            saved_mb = (size - new_size) / 1024 / 1024
+            print(f"    [pypdf OK] {new_size / 1024 / 1024:.1f} MB (sparade {saved_mb:.1f} MB)")
+        else:
+            tmp.unlink(missing_ok=True)
+            print(f"    [pypdf] Ingen vinst – behaller original")
+    except Exception as exc:
+        tmp.unlink(missing_ok=True)
+        print(f"    [Komprimeringsfel] {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Huvudflöde per kommitté
 # ---------------------------------------------------------------------------
 
@@ -334,6 +415,8 @@ def process_committee(
             created = merge_with_size_limit(downloaded_pdfs, merged_dir, base_name)
             if not created:
                 print(f"  [Varning] Inga sammanslagna filer skapades for {year}")
+            for merged_file in created:
+                compress_pdf(merged_file)
 
     return downloaded, skipped, failed
 
